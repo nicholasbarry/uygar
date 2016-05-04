@@ -1,0 +1,525 @@
+%% notes
+%{
+sbatch --gres=gpu:1 --mem=128000 -n 1 -c 20 script args
+* imgFilePath, unitTest must be set before this script is runfile
+* will create a new directory in place in which all files are saved out
+* take care that all functions must be on the current path
+* dependencies:
+    bm4d
+        bm4d_thr_mex
+        bm4d_wie_mex
+    get_intensity_gradient
+    find_background
+    assign6BoundariesNB_mex
+        or assign6BoundariesNB
+    removeSmallComponentsNB
+    splitHardSuperVoxels_kmeans
+        snrAwareKmeans
+    calculate_sAff
+    rgb2luv
+    snrAwareKmeans
+        simple_fkmeans
+    segProjectionWrite
+
+* when this script concludes, inspect the image and build manipulationSets
+accordingly. then run superVoxelize2 from the new directory, as it will
+look for variables saved out from this session.
+
+* repeat the inspect->manipulate loop to taste
+
+* bm4d is hopelessly single-threaded and b/c it's in a binary, can't view
+* TO DO in removesmallcomponents
+    - ind2sub outside parfor?
+    - profile to look for bottlenecks ? why 4 hrs?
+    - why did this STOP taking 4 hrs?
+* 
+%}
+
+%% initialization
+if exist('noProfile','var') && ~noProfile;profile on;end;
+if ~exist('jobID','var') || isempty(jobID);jobID='';end;
+
+% path manipulation
+[~,imgFilename,~]                                        = fileparts(imgFilePath);
+dirname                                                  = [imgFilename,'_','Segmentation',jobID];
+if unitTest;dirname=[dirname,'_unitTest'];end;
+
+if exist([dirname,'/',imgFilename,'_1_runParameters.mat'],'file')
+    load([dirname,'/',imgFilename,'_1_runParameters.mat'])
+    start = datetime;
+else
+    % specify run parameters
+    CHANNELCOUNT                                             = 3;          % eg, R,G,B can this be extracted programmatically? eg, info.PhotometricInterpretation == 'RGB'
+    sigma                                                    = 2000;
+
+    superVoxelOpts.HMINTH26                                  = 0.008;      % higher = faster, eg 0.01, due to number of regions watershed() spits out => (number SVs)
+    superVoxelOpts.spatialDistanceUpperBound                 = 10;         % orig at 31, lower=faster, try 10-15, big impact on runtime (in calculate_sAff)
+    superVoxelOpts.colorDistanceUpperBound                   = 0.1;        %0.03;
+
+    superVoxelOpts.splitHardSVopts.detThreshold              = 5e-11;      % increase to maybe 10e-10 for runtime checks. controls homogeneity of svoxels
+    superVoxelOpts.splitHardSVopts.connectivity              = 26;
+    superVoxelOpts.splitHardSVopts.subdivisionSizeThreshold  = 10;         % increasing this will bring down runtime (fewer SVs will be split/created the higher it gets)
+    
+    superVoxelOpts.splitHardSVopts.opts_fkmeans.careful      = true;
+    superVoxelOpts.splitHardSVopts.opts_fkmeans.maxIter      = 1000;       % number of iterations clustering should go through
+    superVoxelOpts.splitHardSVopts.opts_fkmeans.repeats      = 5;
+    superVoxelOpts.splitHardSVopts.opts_fkmeans.weight       = 0;
+
+    superVoxelOpts.removeSmallComponents.minVoxelCount       = 10;         % higher = faster (in removeSmallComponents). test at 100.
+    superVoxelOpts.removeSmallComponents.moiRatioThreshold   = 3;
+    superVoxelOpts.removeSmallComponents.zAnisotropy         = 3;
+    superVoxelOpts.removeSmallComponents.precise             = 1;
+
+    clusterCount                                             = 30;         % initial guess as to how many neurons are in the volume
+
+
+    if unitTest                                                            % if testing code
+        cutoff                                                   = 12;         % number of slices to go through for testing purposes
+        superVoxelOpts.splitHardSVopts.detThreshold              = 10e-10;
+        superVoxelOpts.spatialDistanceCalculationOpts.upperBound = 10;
+        superVoxelOpts.HMINTH26                                  = 0.01;
+        superVoxelOpts.removeSmallComponents.precise             = 0;
+    end
+
+    graphData.opts_irbleigs.K = 20;
+    graphData.c1              = 2e-4;
+    graphData.c2              = 1e-3;
+    graphData.c2sf            = 0;
+    graphData.nC              = 0.1;
+    graphData.s1              = 0.4;
+    graphData.s2              = 1;
+    graphData.sig             = 0;
+
+
+    %% housekeeping
+
+    start         = datetime;
+
+    % img data
+    info          = imfinfo(imgFilePath);
+    numXpixels    = info(1).Width;
+    numYpixels    = info(1).Height;
+    stackHeight   = numel(info); 
+    if unitTest;stackHeight=cutoff;end;                                         % unit test
+    numSlices     = stackHeight/CHANNELCOUNT;
+    mkdir(dirname);
+
+    % save run parameters
+    save([dirname,'/',imgFilename,'_1_runParameters.mat'],'start','dirname','CHANNELCOUNT','sigma','superVoxelOpts','clusterCount','unitTest','graphData','numXpixels','numYpixels','numSlices','stackHeight','imgFilePath','imgFilename','-v7.3')
+end
+
+%% print run parameters to console %and save them to text file
+fprintf('***************************************************************************\n')
+fprintf('\nCHANNELCOUNT: %d',CHANNELCOUNT)
+fprintf('\nSigma: %d',sigma)
+fprintf('\nsuperVoxelOpts.HMINTH: %0.3f',superVoxelOpts.HMINTH26);
+fprintf('\nsuperVoxelOpts.spatialDistanceUpperBound: %d',superVoxelOpts.spatialDistanceUpperBound);
+fprintf('\nsuperVoxelOpts.colorDistanceUpperBound: %d',superVoxelOpts.colorDistanceUpperBound);
+fprintf('\nsuperVoxelOpts.splitHardSVopts:\n');disp(superVoxelOpts.splitHardSVopts)
+fprintf('\nsuperVoxelOpts.splitHardSVopts.opts_fkmeans:\n');disp(superVoxelOpts.splitHardSVopts.opts_fkmeans)
+fprintf('\nsuperVoxelOpts.removeSmallComponents:\n');disp(superVoxelOpts.removeSmallComponents)
+fprintf('***************************************************************************\n')
+%write_parameters();
+
+%% ingest img
+if exist([dirname,'/',imgFilename,sprintf('_2_thisVol.mat')],'file')
+    load([dirname,'/',imgFilename,sprintf('_2_thisVol.mat')])
+else
+    fprintf('***************************************************************************\n')
+    thisVol          = zeros(numYpixels, numXpixels, stackHeight);
+    fprintf('\nReading in image...');tic
+    parfor i = 1:stackHeight;
+        thisVol(:,:,i) = imread(imgFilePath,'Index',i);
+    end
+    save([dirname,'/',imgFilename,sprintf('_2_thisVol.mat')],'thisVol','-v7.3');
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% denoise, normalize
+if exist([dirname,'/',imgFilename,sprintf('_3_denoised_normalized_bm4d_colors%d_sigma%d.mat',CHANNELCOUNT,sigma)],'file')
+    load([dirname,'/',imgFilename,sprintf('_3_denoised_normalized_bm4d_colors%d_sigma%d.mat',CHANNELCOUNT,sigma)])
+else
+    fprintf('***************************************************************************\n')
+    %% simultaneously denoise images + separate channels out into bbvol's 4th dimension
+    % takes ~3.8 - 4.5hrs
+    bbVol = zeros(numYpixels,numXpixels,numSlices,CHANNELCOUNT);
+    fprintf('\nDenoising...');tic
+    parfor i = 1:CHANNELCOUNT
+        bbVol(:,:,:,i) = bm4d(squeeze(thisVol(:,:,i:CHANNELCOUNT:stackHeight)), 'Gauss', sigma); % bm4d not multithreaded but minimal parfor speedup "due to the way memory (cache in particular) is accessed" (per Foi)
+    end
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    clear thisVol i;
+    
+    %% normalize each channel's intensity
+    fprintf('\nNormalizing each channel''s intensity...');tic
+    bbVol(bbVol<0)=0;
+    parfor i = 1:CHANNELCOUNT
+        rawStack = bbVol(:,:,:,i);
+        rawStack = rawStack - min(rawStack(:)); 
+        rawStack = rawStack / max(rawStack(:)); 
+        bbVol(:,:,:,i) = rawStack;
+    end
+    
+    % checkpoint
+    save([dirname,'/',imgFilename,sprintf('_3_denoised_normalized_bm4d_colors%d_sigma%d.mat',CHANNELCOUNT,sigma)], 'bbVol', '-v7.3')
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% watershed
+fprintf('***************************************************************************\n')
+if exist([dirname,'/',imgFilename,'_4_watershed.mat'],'file')
+    load([dirname,'/',imgFilename,'_4_watershed.mat'])
+else
+    if exist([dirname,'/',imgFilename,'_2.5_watershed.mat'],'file')
+        load([dirname,'/',imgFilename,'_2.5_watershed.mat'])
+    else
+        %% find the maximum intensity gradient of each point across all dimensions/colors
+        % can probably do this better (padarray?), but it goes pretty fast as-is ? <20s on a 1GB stack
+        fprintf('\nCalculating intensity gradient...');tic
+        gradAmplitude = get_intensity_gradient(numYpixels, numXpixels, numSlices,bbVol);
+        fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+
+        %% 26-WATERSHED SEGMENTATION, 0 DENOTES WATERSHED BOUNDARIES
+        % takes ~8min on 1 node
+        fprintf('\nCalculating watershed...');tic
+        L0 = watershed(imhmin(gradAmplitude, superVoxelOpts.HMINTH26), 26); % L0: boundaries are 0, every voxel is labeled with the number of the segment it belongs to. NO BACKGROUND GIVEN. can only compile w/ {4,8}
+        % debug
+        unique_regions = unique(L0);
+        num_unique_regions = numel(unique_regions);
+        while false;%unique_regions > 200000
+            fprintf('\nToo many watershed regions (%d) for this HMINTH ( = %f, done in %f). Trying again with HMINTH = %f.\n',num_unique_regions,superVoxelOpts.HMINTH26,toc,superVoxelOpts.HMINTH26 + .001)
+            superVoxelOpts.HMINTH26 = superVoxelOpts.HMINTH26 + 0.001;
+            L0 = watershed(imhmin(gradAmplitude, superVoxelOpts.HMINTH26), 26); % L0: boundaries are 0, every voxel is labeled with the number of the segment it belongs to. NO BACKGROUND GIVEN???
+            unique_regions = unique(L0);
+            num_unique_regions = numel(unique_regions);
+        end
+        fprintf('\nSetting HMINTH26 = %f yields %d unique watershed regions.\n',superVoxelOpts.HMINTH26,num_unique_regions-1);
+        fprintf('\nSaving L0...\n\n');tic
+        save([dirname,'/',imgFilename,'_2.5_watershed.mat'],'L0','unique_regions','-v7.3')
+        save([dirname,'/',imgFilename,'_1_runParameters.mat'],'superVoxelOpts','-append')
+        fprintf('               done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    end
+    
+    % need some feature that returns a mask of L to label as "background"
+    % simple method for assigning background
+    fprintf('\nAssigning background... \n');tic
+    [L1] = find_background(L0,unique_regions); % assigns background to largest watershed region
+    fprintf('                         done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start));
+    fprintf('\nSaving L1...\n\n')
+    save([dirname,'/',imgFilename,'_4_watershed.mat'],'L1','-v7.3')
+    fprintf('               done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% filter on boundaries
+if exist([dirname,'/',imgFilename,'_5_assign6.mat'],'file')
+    load([dirname,'/',imgFilename,'_5_assign6.mat'])
+else
+    fprintf('***************************************************************************\n')
+    stackSize = size(L1);
+    numVoxels = numel(L1);
+
+    fprintf('\nAssigning watershed boundaries to objects...\n');tic % takes ~6000s = 1.66 hr on 1 node
+    try % gets rid of boundaries; L2: 1 = background, 2...max(L2(:)) = watershed regions
+        L2 = assign6BoundariesNB_mex(double(L1), bbVol); % exceeds intmax() when compiling on openmind ? not sure if there's a workaround? double? vs int32?
+    catch err
+        disp(err.identifier)
+        disp(err.message)
+        disp(err.cause)
+        disp(err.stack)
+        fprintf('MEX file failed. trying uncompiled function..\n')
+        L2 = assign6BoundariesNB(L1, bbVol); 
+    end
+    fprintf('\n                                               done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+
+    % checkpoint
+    fprintf('\nSaving L2...\n\n')
+    save([dirname,'/',imgFilename,'_5_assign6.mat'], 'L2', 'stackSize','numVoxels','-v7.3')
+    fprintf('***************************************************************************\n')
+end
+
+%% filter out small supervoxels
+if exist([dirname,'/',imgFilename,'_6_mask.mat'],'file')
+    load([dirname,'/',imgFilename,'_6_mask.mat'])
+else
+    fprintf('***************************************************************************\n')
+    fprintf('\nRemoving small components...');tic % takes ~13860s = 3.8hrs on 1 node
+    mask = removeSmallComponentsNB(L2~=1, superVoxelOpts.removeSmallComponents);
+    fprintf(' done in %0.2f seconds, total time: %s.\n',toc,char(datetime-start))
+    fprintf('\nSaving mask...\n\n');tic
+    save([dirname,'/',imgFilename,'_6_mask.mat'],'mask','-v7.3')
+    fprintf('                 done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% store supervoxels 
+if exist([dirname,'/',imgFilename,'_7_superVoxelCells.mat'],'file')
+    load([dirname,'/',imgFilename,'_7_superVoxelCells.mat'])
+else
+    fprintf('***************************************************************************\n')
+    L3        = L2;
+    L3(~mask) = 1;
+    regions   = unique(L3);
+    fprintf('\nForming %d supervoxels...\n\n',numel(regions)-1);tic            % takes ~30-45min
+    
+    superVoxelCells = cell(1,numel(regions)-1);                            % (superVoxelCells is a cell array where each cell is a list of the linear indices of L where that cell's supervoxel has pixels)
+    
+    if gpuDeviceCount
+        superVoxelCells = gather(arrayfun(@(x) find(gpuArray(L3)==x),regions(2:end),'UniformOutput',false)); % no this is the wrong way to use the GPU
+    else
+        parfor i = 1:numel(superVoxelCells) 
+            superVoxelCells{i} = find(L3==regions(i+1));
+        end;
+    end
+    fprintf('                        done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    
+    % checkpoint
+    fprintf('\nSaving superVoxelCells...\n\n');tic
+    save([dirname,'/',imgFilename,'_7_superVoxelCells.mat'],'superVoxelCells','-v7.3')
+    fprintf('                            done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% split heterogeneous supervoxels
+if exist([dirname,'/',imgFilename,'_8_split_superVoxelCells.mat'],'file')
+    load([dirname,'/',imgFilename,'_8_split_superVoxelCells.mat'])
+else
+    fprintf('***************************************************************************\n')
+    % takes about 14785s = 4.1hrs
+    fprintf('\nSplitting heterogeneous supervoxels...');tic
+    
+    % debug
+    inc = 2;
+    
+    num_SVs1 = numel(superVoxelCells);
+    
+    fprintf('\nStarting with %d superVoxels.\n',num_SVs1);
+    
+    superVoxelCells = splitHardSuperVoxels_kmeans(superVoxelOpts.splitHardSVopts, superVoxelCells, bbVol); 
+    %superVoxelCells = splitHardSuperVoxels_cluster(superVoxelOpts.splitHardSVopts, superVoxelCells, bbVol); 
+    
+    num_SVs2 = numel(superVoxelCells);
+    
+    fprintf('\nSplitting with detThreshold = %f and subdivisionSizeThreshold = %d creates %d new superVoxels, (%d pre, %d post)..\n',superVoxelOpts.splitHardSVopts.detThreshold,superVoxelOpts.splitHardSVopts.subdivisionSizeThreshold,num_SVs2-num_SVs1,num_SVs1,num_SVs2);
+    while false
+    %while (num_SVs2 < 500000) && (superVoxelOpts.splitHardSVopts.detThreshold > 5e-11)
+        fprintf('\nToo few supervoxels(%d) for this detThreshold ( = %f, done in %f). Trying again with detThreshold = %f gives us.. ',num_SVs2,superVoxelOpts.splitHardSVopts.detThreshold,toc,superVoxelOpts.splitHardSVopts.detThreshold / inc)
+        superVoxelOpts.splitHardSVopts.detThreshold = superVoxelOpts.splitHardSVopts.detThreshold / inc;
+        superVoxelCells = splitHardSuperVoxels_kmeans(superVoxelOpts.splitHardSVopts, superVoxelCells, bbVol); 
+        num_SVs2 = numel(superVoxelCells);
+        fprintf(' %d supervoxels.\n.',num_SVs2);
+    end
+    
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+
+    % checkpoint
+    fprintf('\nSaving split superVoxelCells...\n\n');tic
+    save([dirname,'/',imgFilename,'_8_split_superVoxelCells.mat'],'superVoxelCells','-v7.3')
+    save([dirname,'/',imgFilename,'_1_runParameters.mat'],'superVoxelOpts','-append')
+    fprintf('                                  done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% get supervoxel means, boundaries
+if exist([dirname,'/',imgFilename,'_9_superVoxelBoundaries.mat'],'file')
+    load([dirname,'/',imgFilename,'_9_superVoxelBoundaries.mat'])
+else
+    fprintf('***************************************************************************\n')
+    % takes ~6min
+    stackSize        = size(bbVol);
+    stackSize        = stackSize(1:3);
+    voxelCount       = prod(stackSize);
+    fprintf('\nCalculating supervoxel means and boundaries...');tic
+    cc                        = numel(superVoxelCells);
+    superVoxelMeans           = zeros(cc, CHANNELCOUNT);
+    boundaryVoxels            = cell(1, cc);
+    boundaryVoxelsSub         = cell(1, cc);
+    shift_by_channel          = voxelCount*(0:size(bbVol, 4)-1);
+    
+    parfor kk = 1:cc
+        [xx,yy,zz]            = ind2sub(stackSize, superVoxelCells{kk});        % (returns the xyz coordinates in the stack of all the pixels in the current supervoxel)
+        xSub                  = min(xx)-2;
+        ySub                  = min(yy)-2;
+        zSub                  = min(zz)-2;
+        xx                    = xx-xSub;
+        yy                    = yy-ySub;
+        zz                    = zz-zSub;
+        maxxx                 = max(xx);
+        maxyy                 = max(yy);
+        maxzz                 = max(zz);
+        tmp                   = false(maxxx+1, maxyy+1, maxzz+1);
+        reducedIndices        = sub2ind([maxxx+1, maxyy+1, maxzz+1], xx, yy, zz);
+        tmp(reducedIndices)   = true;
+        localBoundaryVoxels   = find(tmp & ~imerode(tmp, ones(3,3,3)));
+
+        if ~isempty(localBoundaryVoxels)
+            [xx,yy,zz]        = ind2sub(size(tmp), localBoundaryVoxels);
+        end
+
+        xx                    = xx+xSub;
+        yy                    = yy+ySub;
+        zz                    = zz+zSub;
+        boundaryVoxelsSub{kk} = [xx,yy,zz];
+        boundaryVoxels{kk}    = sub2ind(stackSize, xx, yy, zz);             % is this ever used? 
+
+        [foo, bar]            = meshgrid(shift_by_channel, superVoxelCells{kk});
+        superVoxelMeans(kk,:) = mean(bbVol(foo+bar), 1);
+    end
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+
+
+    % checkpoint
+    fprintf('\nSaving supervoxel boundaries...\n\n');tic
+    save([dirname,'/',imgFilename,'_9_superVoxelBoundaries.mat'], 'cc', 'superVoxelMeans', 'boundaryVoxelsSub', '-v7.3')
+    fprintf('                                  done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% calculate supervoxel affinities
+if exist([dirname,'/',imgFilename,'_10_superVoxelAffinities.mat'],'file')
+    load([dirname,'/',imgFilename,'_10_superVoxelAffinities.mat'])
+else
+    fprintf('***************************************************************************\n')
+    % get affinity graph
+    fprintf('\nCalculating supervoxel affinities, upperbound = %d...\n',superVoxelOpts.spatialDistanceUpperBound);tic
+    sAff = calculate_sAff(cc, boundaryVoxelsSub, superVoxelOpts.spatialDistanceUpperBound); 
+    fprintf('\nCalculating supervoxel affinities, upperbound = %d... done in %0.2f seconds, total time: %s.\n\n',superVoxelOpts.spatialDistanceUpperBound,toc,char(datetime-start))
+
+    % generate square_sAff
+    [ii_sAff, ~, ss_sAff] = find(sAff);
+    yy = ceil( (2*cc-1 - sqrt((2*cc-1)^2-8*ii_sAff))/2 );
+    xx = ii_sAff - cc*yy + cc + yy.*(yy+1)/2;
+    square_sAff = sparse(xx, yy, ss_sAff, cc, cc);
+    square_sAff = square_sAff + transpose(square_sAff); % send to stefanie
+    clear ii_sAff; clear ss_sAff; clear xx; clear yy;
+
+    % checkpoint
+    fprintf('\nSaving supervoxel affinities...\n\n');tic
+    save([dirname,'/',imgFilename,'_10_superVoxelAffinities.mat'], 'sAff','cc','square_sAff', '-v7.3');
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    fprintf('***************************************************************************\n')
+end
+
+%% initial clustering
+if exist([dirname,'/',imgFilename,'_11_clustering.mat'],'file')
+    load([dirname,'/',imgFilename,'_11_clustering.mat'])
+else
+    fprintf('***************************************************************************\n')
+    fprintf('\nClustering...');tic
+
+    superVoxelOpts.splitHardSVopts.opts_fkmeans.weight  = sqrt(cellfun(@numel,superVoxelCells)');
+    save([dirname,'/',imgFilename,'_1_runParameters.mat'],'superVoxelOpts','-append')
+    
+    if CHANNELCOUNT <= 3
+        superVoxelMeansLUV          = rgb2luv(superVoxelMeans')'; % send these two to stefanie
+    else
+        superVoxelMeansLUV(:,1:3)   = rgb2luv(superVoxelMeans(:,1:3)')';
+        superVoxelMeansLUV(:,4:end) = superVoxelMeans(:,4:end)*50;
+    end
+
+    index                           = snrAwareKmeans(superVoxelMeansLUV, clusterCount, superVoxelOpts.splitHardSVopts.opts_fkmeans);
+    
+    fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+    % checkpoint
+    save([dirname,'/',imgFilename,'_11_clustering.mat'],'superVoxelMeansLUV','index','superVoxelOpts','-v7.3');
+    save([dirname,'/',imgFilename,'_ForStefanie.mat'],'superVoxelMeansLUV','superVoxelMeans','square_sAff');
+    fprintf('***************************************************************************\n')
+end
+
+%% human interaction
+fprintf('Creating Z projection... ');tic
+[jpgFilepath] = segProjectionWrite(stackSize,clusterCount,index,superVoxelCells,dirname,imgFilename,bbVol,numXpixels,numYpixels,superVoxelOpts);
+fprintf('                         done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+save([dirname,'/',imgFilename,'_12_forManipulation.mat'],'index','graphData','superVoxelMeansLUV','square_sAff','stackSize','superVoxelCells','numXpixels','numYpixels','-v7.3');
+
+fprintf('superVoxelize1 done in %s.\n\n',char(datetime-start))
+
+if exist('noProfile','var') && ~noProfile
+    cd(dirname)
+    profsave
+    cd ..
+end
+
+
+%{
+human chooses which superVoxels to manipulatethrough manipulateClusters which spits back out the
+index (which may have entries <1 in it)
+which is then fed into calculateNormalizedCuts_mem through the following
+code:
+
+(if you like segprojection enough after snrKmeans, you can stop there.
+essentially, calculateNormalizedCuts_mem is a way of refining the color
+segmentation and takes as input human decisions that reduce the Nk landscape
+it has to search through)
+
+human looks at collage of 2D supervoxel projections in the image generated 
+in segProjectionWrite and specifies which to split/merge/delete/etc via
+manipulationSets
+%}
+
+%% superVoxelize2.m (replace old file contents)
+% 
+% % pass it imgFilePath to set up / save out properly
+% % pass it manipulationSets to manipulateClusters
+% % repeat this script until satisfied
+% 
+% [~,imgFilename,~]                                        = fileparts(imgFilePath);
+% dirname                                                  = [imgFilename,'_','Segmentation'];
+% load([dirname,'/',imgFilename,'_forManipulation.mat']);
+% 
+% fprintf('\nManipulating supervoxels...');tic
+% indexUI = manipulateClusters(index, manipulationSets, superVoxelMeansLUV, opts_fkmeans);
+% fprintf(' done in %0.2f seconds.\n\n',toc)
+% 
+% segprojectionWrite
+% 
+% if ~strcmp(java.lang.System.getProperty('java.awt.headless'),'true')
+%     imshow(jpgFilepath);
+% end
+% 
+% save([dirname,'/',imgFilename,'_forGraphCuts.mat'],'-V7.3');
+
+
+%% superVoxelize3.m
+% %{
+% % pass it imgFilePath to set up / save out properly
+% 
+% %}
+% [~,imgFilename,~]                                        = fileparts(imgFilePath);
+% dirname                                                  = [imgFilename,'_','Segmentation'];
+% load([dirname,'/',imgFilename,'_forGraphCuts.mat']);
+% start = datetime;
+% for kk = 1:max(indexUI)
+%   seedSets{kk} = find(indexUI==kk);
+% end
+% 
+% % calculateNormalizedCuts_mem
+% graphData.seedSets = seedSets;
+% graphData.ccIDsOfSVs = indexUI;
+% graphData.colorData          = superVoxelMeansLUV;
+% graphData.square_sAff        = square_sAff;
+% graphData.svSizes            = voxelCounts;
+% graphData.stackSize          = stackSize;
+% graphData.minClumpCount      = 0.005 * cc / graphData.opts_irbleigs.K;
+% graphData.minSVcountFraction = 0.1 / graphData.opts_irbleigs.K;
+% 
+% fprintf('\nCalculating normalized cuts...');tic
+% [index, scoreInf, score1]    = calculateNormalizedCuts_mem(graphData);
+% fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+% 
+% % inspect
+% segProjectionWrite
+% 
+% % checkpoint
+% save([dirname,'/',imgFilename,'_normCuts.mat'],'index','-v7.3');
+
+%% visualization
+
+% fprintf('\nVisualizing supervoxels...');tic
+% segProjectionWrite
+% fprintf(' done in %0.2f seconds, total time: %s.\n\n',toc,char(datetime-start))
+
+%% finish up
+%save([dirname 'varsForRunUygar2.mat'],'index','stackSize','superVoxelCells','numXpixels','numYpixels','dirname','imgFilename','superVoxelMeansLUV', 'opts_fkmeans','graphData','square_sAff','voxelCounts')
