@@ -53,7 +53,7 @@ else
     sigma                                                    = 2000;
 
     superVoxelOpts.HMINTH26                                  = 0.008;      % higher = faster, eg 0.01, due to number of regions watershed() spits out => (number SVs)
-    superVoxelOpts.spatialDistanceUpperBound                 = 10;         % orig at 31, lower=faster, try 10-15, big impact on runtime (in calculate_sAff)
+    superVoxelOpts.spatialDistanceUpperBound                 = 31;         % orig at 31, lower=faster, try 10-15, big impact on runtime (in calculate_sAff)
     superVoxelOpts.colorDistanceUpperBound                   = 0.1;        %0.03;
 
     superVoxelOpts.splitHardSVopts.detThreshold              = 5e-11;      % increase to maybe 10e-10 for runtime checks. controls homogeneity of svoxels
